@@ -471,6 +471,357 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
 
 <script>
 // ---------------- NUMBER EXTRACTION ----------------
+function extractNumbers(text) {
+    var out = [], seen = {};
+    String(text).split(/[\\r\\n]+/).forEach(function(line) {
+        line.split(/\\s{2,}|[,;|\\t]+/).forEach(function(cell) {
+            var d = cell.replace(/\\D/g, '');
+            if (d.indexOf('260') === 0) d = d.slice(3);
+            while (d.length > 9 && d.charAt(0) === '0') d = d.slice(1);
+            if (d.length === 9 && !seen[d]) { seen[d] = 1; out.push(d); }
+        });
+    });
+    return out;
+}
+
+function showBulkMsg(text, ok) {
+    var el = document.getElementById('bulk-msg');
+    el.textContent = text;
+    el.className = 'msg ' + (ok ? 'msg-ok' : 'msg-err');
+    el.style.display = 'block';
+    setTimeout(function() { el.style.display = 'none'; }, 6000);
+}
+
+document.getElementById('bulk-add-btn').addEventListener('click', async function() {
+    var nums = extractNumbers(document.getElementById('bulk-text').value);
+    if (nums.length === 0) { showBulkMsg('No 9-digit numbers found in the box.', false); return; }
+    var btn = this, old = btn.textContent;
+    btn.disabled = true; btn.textContent = 'Adding ' + nums.length + '...';
+    try {
+        var resp = await fetch('/add-bulk', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ phones: nums })
+        });
+        var d = await resp.json();
+        if (d.success) {
+            showBulkMsg('Added ' + d.added + ' - already had ' + d.skipped + (d.invalid ? ' - skipped ' + d.invalid + ' not-9-digit' : ''), true);
+            document.getElementById('bulk-text').value = '';
+            if (window.refreshStats) window.refreshStats();
+        } else { showBulkMsg(d.error || 'Error', false); }
+    } catch (e) { showBulkMsg('Network error', false); }
+    btn.disabled = false; btn.textContent = old;
+});
+
+function preprocess(src) {
+    var maxSide = Math.max(src.width, src.height);
+    var scale = maxSide < 1600 ? (1600 / maxSide) : 1;
+    var w = Math.round(src.width * scale), h = Math.round(src.height * scale);
+    var c = document.createElement('canvas');
+    c.width = w; c.height = h;
+    var ctx = c.getContext('2d');
+    ctx.drawImage(src, 0, 0, w, h);
+    try {
+        var img = ctx.getImageData(0, 0, w, h), d = img.data;
+        for (var i = 0; i < d.length; i += 4) {
+            var g = 0.299 * d[i] + 0.587 * d[i+1] + 0.114 * d[i+2];
+            g = g < 110 ? 0 : (g > 165 ? 255 : g);
+            d[i] = d[i+1] = d[i+2] = g;
+        }
+        ctx.putImageData(img, 0, 0);
+    } catch (e) {}
+    return c;
+}
+
+async function scanCanvasIntoBox(canvas, statusEl) {
+    var say = function(t, ok) { if (statusEl) statusEl.textContent = t; else showBulkMsg(t, ok); };
+    say('Reading numbers (can take a few seconds)...', true);
+    try {
+        var result = await Tesseract.recognize(canvas, 'eng', { tessedit_char_whitelist: '0123456789 +' });
+        var text = (result.data && result.data.text) || '';
+        var nums = extractNumbers(text);
+        if (nums.length === 0) { say('No 9-digit numbers found. Try a sharper, well-lit photo.', false); return 0; }
+        var box = document.getElementById('bulk-text');
+        var existing = box.value.trim();
+        box.value = (existing ? existing + '\\n' : '') + nums.join('\\n');
+        showBulkMsg('Read ' + nums.length + ' number(s) into the box. Check them, then tap Add all.', true);
+        return nums.length;
+    } catch (e) { say('Could not read the image: ' + e.message, false); return 0; }
+}
+
+document.getElementById('photo-input').addEventListener('change', function(e) {
+    var file = e.target.files && e.target.files[0];
+    if (!file) return;
+    var img = new Image();
+    img.onload = async function() {
+        var c = document.createElement('canvas');
+        c.width = img.naturalWidth; c.height = img.naturalHeight;
+        c.getContext('2d').drawImage(img, 0, 0);
+        await scanCanvasIntoBox(preprocess(c), null);
+        URL.revokeObjectURL(img.src);
+    };
+    img.src = URL.createObjectURL(file);
+    e.target.value = '';
+});
+
+var camStream = null;
+document.getElementById('scan-btn').addEventListener('click', openCamera);
+
+async function openCamera() {
+    var modal = document.getElementById('cam-modal');
+    var video = document.getElementById('cam-video');
+    var capBtn = document.getElementById('cam-capture');
+    modal.style.display = 'flex';
+    document.getElementById('cam-results').innerHTML = '';
+    capBtn.textContent = 'Capture';
+    capBtn.disabled = false;
+    capBtn.onclick = captureNumbers;
+    document.getElementById('cam-status').textContent = 'Starting camera...';
+    try {
+        camStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } } });
+        video.srcObject = camStream;
+        video.style.display = 'block';
+        document.getElementById('cam-status').textContent = 'Fill the frame with the numbers and tap Capture.';
+    } catch (e) {
+        document.getElementById('cam-status').textContent = 'Cannot open camera: ' + e.message;
+    }
+}
+
+function stopCam() {
+    if (camStream) { camStream.getTracks().forEach(function(t){ t.stop(); }); camStream = null; }
+    document.getElementById('cam-video').style.display = 'none';
+}
+
+function closeCamera() {
+    stopCam();
+    document.getElementById('cam-modal').style.display = 'none';
+}
+
+async function captureNumbers() {
+    var video = document.getElementById('cam-video');
+    var canvas = document.getElementById('cam-canvas');
+    var status = document.getElementById('cam-status');
+    if (!camStream || !video.videoWidth) { status.textContent = 'Camera not ready yet.'; return; }
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    canvas.getContext('2d').drawImage(video, 0, 0);
+    stopCam();
+    document.getElementById('cam-capture').disabled = true;
+    var n = await scanCanvasIntoBox(preprocess(canvas), status);
+    setTimeout(closeCamera, n > 0 ? 900 : 2500);
+}
+</script>
+</body>
+</html>`);
+    } catch (e) {
+        res.status(500).send('Error');
+    }
+});
+
+// ---------------- MAIN DASHBOARD ----------------
+
+app.get('/', async (req, res) => {
+    try {
+        const total = await count();
+
+        res.send(`<!DOCTYPE html>
+<html>
+<head>
+<title>All Numbers - Total</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+.db{background:#080b10;border-radius:20px;padding:24px;width:100%;max-width:520px}
+.top-bar{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
+.db-title{font-size:18px;font-weight:600;color:#fff}
+.pill{padding:6px 14px;border-radius:20px;font-size:11px;font-weight:600;display:flex;align-items:center;gap:6px;background:#0d4429;color:#3fb950}
+.dot{width:7px;height:7px;border-radius:50%;animation:blink 1.2s infinite;background:#3fb950}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:0.15}}
+.total-box{background:#0d1420;border:1.5px solid #30363d;border-radius:16px;padding:28px 20px;margin-bottom:16px;text-align:center}
+.tl{font-size:10px;font-weight:600;letter-spacing:1px;text-transform:uppercase;color:#8b949e;margin-bottom:10px}
+.tn{font-size:72px;font-weight:500;line-height:1;letter-spacing:-2px;color:#e6edf3;margin-bottom:6px}
+.td{font-size:12px;color:#4b5563;margin-bottom:16px}
+.vbtn{display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:10px 20px;border-radius:8px;font-size:12px;font-weight:600;border:none;background:#92400e;color:#fed7aa;text-decoration:none}
+.vcnt{background:#fed7aa;color:#92400e;border-radius:20px;padding:1px 8px;font-size:10px;font-weight:700}
+.add-box{background:#0d1117;border:1.5px solid #21262d;border-radius:12px;padding:18px 20px;margin-bottom:16px}
+.add-title{font-size:12px;font-weight:600;color:#8b949e;margin-bottom:12px;letter-spacing:0.5px;text-transform:uppercase}
+.add-row{display:flex;gap:8px;flex-wrap:wrap}
+.add-input{flex:1;min-width:110px;background:#161b22;border:1px solid #30363d;color:#e6edf3;padding:10px 12px;border-radius:8px;font-size:13px;outline:none}
+.add-input::placeholder{color:#4b5563}
+.add-btn{background:#1a3a6e;border:none;color:#a8d0ff;padding:10px 16px;border-radius:8px;font-size:13px;font-weight:500;cursor:pointer}
+.msg{font-size:12px;margin-top:8px;padding:7px 10px;border-radius:6px;display:none}
+.msg-ok{background:#0d4429;color:#3fb950}.msg-err{background:#4b1111;color:#f87171}
+.footer{display:flex;justify-content:space-between;align-items:center;margin-top:4px}
+.tick{font-size:11px;color:#3fb950;font-family:monospace;opacity:0.7}
+.hint{font-size:10px;color:#252b35}
+.pm{position:fixed;inset:0;background:rgba(0,0,0,0.88);display:flex;align-items:center;justify-content:center;padding:20px;z-index:100}
+.pb{background:#0d1117;border:1.5px solid #21262d;border-radius:16px;padding:24px;width:100%;max-width:400px;text-align:center}
+.ptt{font-size:15px;font-weight:500;color:#e6edf3;margin-bottom:6px}
+.ps2{font-size:12px;color:#8b949e;margin-bottom:14px}
+.pr{display:flex;gap:10px}
+.pc{flex:1;background:#161b22;border:1px solid #30363d;color:#8b949e;padding:10px;border-radius:8px;font-size:13px;cursor:pointer}
+.pco{flex:1;border:none;padding:10px;border-radius:8px;font-size:13px;cursor:pointer}
+</style>
+</head>
+<body>
+<div class="db">
+<div class="top-bar">
+    <div class="db-title">&#128210; All Numbers</div>
+    <div class="pill"><div class="dot"></div><span>Live</span></div>
+</div>
+
+<div class="total-box">
+    <div class="tl">&#8721; Total numbers</div>
+    <div class="tn" id="num-total">${total}</div>
+    <div class="td">All the numbers you have</div>
+    <a href="/view/all" class="vbtn">View all <span class="vcnt" id="cnt-total">${total}</span></a>
+</div>
+
+<div class="add-box">
+    <div class="add-title">&#43; Add number</div>
+    <div class="add-row">
+        <input class="add-input" id="inp-phone" placeholder="Phone number (9 digits)" type="text" inputmode="numeric">
+        <button class="add-btn" id="add-btn">Add</button>
+    </div>
+    <div class="msg" id="add-msg"></div>
+</div>
+
+<div class="add-box">
+    <div class="add-title">&#128203; Add many at once</div>
+    <textarea id="bulk-text" placeholder="Paste or type numbers — one per line..." style="width:100%;min-height:90px;resize:vertical;background:#161b22;border:1px solid #30363d;color:#e6edf3;padding:10px 12px;border-radius:8px;font-size:14px;font-family:monospace;outline:none"></textarea>
+    <div class="add-row" style="margin-top:8px">
+        <button class="add-btn" id="bulk-add-btn">Add all</button>
+        <button class="add-btn" id="scan-btn" style="background:#0a3a2a;color:#7fe3b0">&#128247; Scan</button>
+        <label class="add-btn" for="photo-input" style="background:#1a2f55;color:#a8d0ff;cursor:pointer">&#128247; Photo</label>
+        <input type="file" id="photo-input" accept="image/*" style="display:none">
+    </div>
+    <div class="msg" id="bulk-msg"></div>
+    <div style="font-size:10px;color:#4b5563;margin-top:8px">Scan/Photo fills the box with what it reads &mdash; check and fix any wrong digits, then tap Add all. Handwriting isn't always read perfectly.</div>
+</div>
+
+<div class="add-box">
+    <div class="add-title">&#128273; Change all passwords</div>
+    <div class="add-row">
+        <input class="add-input" id="cp-old" placeholder="Current password (blank = all)" type="text">
+        <input class="add-input" id="cp-new" placeholder="New password" type="text">
+        <input class="add-input" id="cp-pin" placeholder="PIN" type="password" autocomplete="off" style="max-width:110px">
+        <button class="add-btn" id="cp-btn">Change</button>
+    </div>
+    <div class="msg" id="cp-msg"></div>
+</div>
+
+<div class="footer">
+    <span class="tick" id="tick">--:--:-- CAT</span>
+    <span class="hint">Live data &middot; PostgreSQL</span>
+</div>
+</div>
+
+<div class="pm" id="cam-modal" style="display:none">
+  <div class="pb">
+    <div class="ptt">&#128247; Scan numbers</div>
+    <div class="ps2" id="cam-status">Point the camera at the numbers and tap Capture.</div>
+    <video id="cam-video" playsinline autoplay muted style="width:100%;border-radius:10px;background:#000;margin-bottom:12px;display:none"></video>
+    <canvas id="cam-canvas" style="display:none"></canvas>
+    <div id="cam-results" style="text-align:left;font-size:13px;color:#e6edf3;max-height:160px;overflow:auto;margin-bottom:12px"></div>
+    <div class="pr">
+      <button class="pc" onclick="closeCamera()">Close</button>
+      <button class="pco" id="cam-capture" style="background:#0a3a2a;color:#7fe3b0" onclick="captureNumbers()">Capture</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(function() {
+    function zambiaTime() {
+        return new Date().toLocaleTimeString('en-GB', { timeZone: 'Africa/Lusaka', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    }
+    setInterval(function() { document.getElementById('tick').textContent = zambiaTime() + ' CAT'; }, 1000);
+    document.getElementById('tick').textContent = zambiaTime() + ' CAT';
+
+    function refreshStats() {
+        fetch('/stats').then(r => r.json()).then(d => {
+            document.getElementById('num-total').textContent = d.total;
+            document.getElementById('cnt-total').textContent = d.total;
+        }).catch(function(){});
+    }
+    setInterval(refreshStats, 2000);
+    refreshStats();
+    window.refreshStats = refreshStats;
+
+    function showMsg(text, ok) {
+        var el = document.getElementById('add-msg');
+        el.textContent = text;
+        el.className = 'msg ' + (ok ? 'msg-ok' : 'msg-err');
+        el.style.display = 'block';
+        setTimeout(function() { el.style.display = 'none'; }, 3000);
+    }
+
+    document.getElementById('add-btn').addEventListener('click', function() {
+        var phone = document.getElementById('inp-phone').value.trim();
+        if (!phone) { showMsg('Phone number required', false); return; }
+
+        phone = phone.replace(/\\s+/g, '');
+        while (phone.charAt(0) === '0') phone = phone.substring(1);
+        if (!/^\\d{9}$/.test(phone)) { showMsg('Phone must be 9 digits (no leading 0), e.g. 975232003', false); return; }
+
+        fetch('/add-account', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ phone: phone })
+        })
+        .then(r => r.json())
+        .then(d => {
+            if (d.success) {
+                showMsg('Number added', true);
+                document.getElementById('inp-phone').value = '';
+                refreshStats();
+            } else { showMsg(d.error || 'Could not add number', false); }
+        })
+        .catch(function(){ showMsg('Connection error', false); });
+    });
+
+    function showCpMsg(text, ok) {
+        var el = document.getElementById('cp-msg');
+        el.textContent = text;
+        el.className = 'msg ' + (ok ? 'msg-ok' : 'msg-err');
+        el.style.display = 'block';
+        setTimeout(function() { el.style.display = 'none'; }, 4000);
+    }
+
+    document.getElementById('cp-btn').addEventListener('click', function() {
+        var oldPassword = document.getElementById('cp-old').value.trim();
+        var newPassword = document.getElementById('cp-new').value.trim();
+        var pin = document.getElementById('cp-pin').value.trim();
+        var btn = document.getElementById('cp-btn');
+        if (!newPassword) { showCpMsg('New password required', false); return; }
+        if (!pin) { showCpMsg('PIN required', false); return; }
+        var scope = oldPassword ? 'all numbers with password "' + oldPassword + '"' : 'ALL numbers';
+        if (!confirm('Change password for ' + scope + ' to "' + newPassword + '"?')) return;
+        btn.disabled = true; btn.textContent = 'Changing...';
+        fetch('/change-all-passwords', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pin: pin, oldPassword: oldPassword, newPassword: newPassword })
+        })
+        .then(function(r){ return r.json(); })
+        .then(function(d){
+            if (d.success) {
+                showCpMsg('Updated ' + d.updated + ' number(s)', true);
+                document.getElementById('cp-old').value = '';
+                document.getElementById('cp-new').value = '';
+                document.getElementById('cp-pin').value = '';
+            } else { showCpMsg(d.error || 'Error', false); }
+        })
+        .catch(function(){ showCpMsg('Network error', false); })
+        .then(function(){ btn.disabled = false; btn.textContent = 'Change'; });
+    });
+})();
+</script>
+
+<script>
+// ---------------- NUMBER EXTRACTION ----------------
 // Pull every 9-digit number out of text. Splits columns on big gaps,
 // strips +260 and leading zeros, and de-duplicates.
 function extractNumbers(text) {
