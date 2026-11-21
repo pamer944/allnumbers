@@ -1,0 +1,16 @@
+{
+  "name": "numbers-registry",
+  "version": "1.0.0",
+  "description": "Single dashboard that keeps all my numbers and the running total",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.22.3",
+    "pg": "^8.23.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
