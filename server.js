@@ -50,6 +50,32 @@ app.post('/add-account', async (req, res) => {
     }
 });
 
+app.post('/add-bulk', async (req, res) => {
+    try {
+        var phones = (req.body && req.body.phones) || [];
+        if (!Array.isArray(phones)) phones = [];
+
+        var added = 0, skipped = 0, invalid = 0;
+        var seen = {};
+
+        for (var k = 0; k < phones.length; k++) {
+            var p = String(phones[k]).replace(/\D/g, '');
+            if (p.indexOf('260') === 0) p = p.slice(3);
+            while (p.length > 9 && p.charAt(0) === '0') p = p.slice(1);
+            if (!/^\d{9}$/.test(p)) { invalid++; continue; }
+            if (seen[p]) continue;
+            seen[p] = 1;
+            if (await exists(p)) { skipped++; continue; }
+            await add(p, '');
+            added++;
+        }
+
+        res.json({ success: true, added: added, skipped: skipped, invalid: invalid });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
 app.post('/remove-account', async (req, res) => {
     try {
         const { phone, pin } = req.body || {};
@@ -307,10 +333,21 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
     <div class="add-row">
         <input class="add-input" id="inp-phone" placeholder="Phone number (9 digits)" type="text" inputmode="numeric">
         <button class="add-btn" id="add-btn">Add</button>
-        <button class="add-btn" id="scan-btn" style="background:#0a3a2a;color:#7fe3b0">&#128247; Scan</button>
     </div>
     <div class="msg" id="add-msg"></div>
-    <div style="font-size:10px;color:#4b5563;margin-top:8px">Tip: tap Scan to capture numbers from paper with the camera (keeps 9-digit numbers only).</div>
+</div>
+
+<div class="add-box">
+    <div class="add-title">&#128203; Add many at once</div>
+    <textarea id="bulk-text" placeholder="Paste or type numbers — one per line..." style="width:100%;min-height:90px;resize:vertical;background:#161b22;border:1px solid #30363d;color:#e6edf3;padding:10px 12px;border-radius:8px;font-size:14px;font-family:monospace;outline:none"></textarea>
+    <div class="add-row" style="margin-top:8px">
+        <button class="add-btn" id="bulk-add-btn">Add all</button>
+        <button class="add-btn" id="scan-btn" style="background:#0a3a2a;color:#7fe3b0">&#128247; Scan</button>
+        <label class="add-btn" for="photo-input" style="background:#1a2f55;color:#a8d0ff;cursor:pointer">&#128247; Photo</label>
+        <input type="file" id="photo-input" accept="image/*" style="display:none">
+    </div>
+    <div class="msg" id="bulk-msg"></div>
+    <div style="font-size:10px;color:#4b5563;margin-top:8px">Scan/Photo fills the box with what it reads &mdash; check and fix any wrong digits, then tap Add all. Handwriting isn't always read perfectly.</div>
 </div>
 
 <div class="add-box">
@@ -433,9 +470,114 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
 </script>
 
 <script>
-// ---------------- CAMERA / OCR ----------------
-var camStream = null;
+// ---------------- NUMBER EXTRACTION ----------------
+// Pull every 9-digit number out of text. Splits columns on big gaps,
+// strips +260 and leading zeros, and de-duplicates.
+function extractNumbers(text) {
+    var out = [], seen = {};
+    String(text).split(/[\r\n]+/).forEach(function(line) {
+        line.split(/\s{2,}|[,;|\t]+/).forEach(function(cell) {
+            var d = cell.replace(/\D/g, '');
+            if (d.indexOf('260') === 0) d = d.slice(3);
+            while (d.length > 9 && d.charAt(0) === '0') d = d.slice(1);
+            if (d.length === 9 && !seen[d]) { seen[d] = 1; out.push(d); }
+        });
+    });
+    return out;
+}
 
+function showBulkMsg(text, ok) {
+    var el = document.getElementById('bulk-msg');
+    el.textContent = text;
+    el.className = 'msg ' + (ok ? 'msg-ok' : 'msg-err');
+    el.style.display = 'block';
+    setTimeout(function() { el.style.display = 'none'; }, 6000);
+}
+
+// ---------------- BULK ADD ----------------
+document.getElementById('bulk-add-btn').addEventListener('click', async function() {
+    var nums = extractNumbers(document.getElementById('bulk-text').value);
+    if (nums.length === 0) { showBulkMsg('No 9-digit numbers found in the box.', false); return; }
+
+    var btn = this, old = btn.textContent;
+    btn.disabled = true; btn.textContent = 'Adding ' + nums.length + '...';
+    try {
+        var resp = await fetch('/add-bulk', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ phones: nums })
+        });
+        var d = await resp.json();
+        if (d.success) {
+            showBulkMsg('Added ' + d.added + ' - already had ' + d.skipped + (d.invalid ? ' - skipped ' + d.invalid + ' not-9-digit' : ''), true);
+            document.getElementById('bulk-text').value = '';
+            if (window.refreshStats) window.refreshStats();
+        } else { showBulkMsg(d.error || 'Error', false); }
+    } catch (e) { showBulkMsg('Network error', false); }
+    btn.disabled = false; btn.textContent = old;
+});
+
+// ---------------- IMAGE -> OCR -> BOX ----------------
+function preprocess(src) {
+    var maxSide = Math.max(src.width, src.height);
+    var scale = maxSide < 1600 ? (1600 / maxSide) : 1;
+    var w = Math.round(src.width * scale), h = Math.round(src.height * scale);
+    var c = document.createElement('canvas');
+    c.width = w; c.height = h;
+    var ctx = c.getContext('2d');
+    ctx.drawImage(src, 0, 0, w, h);
+    try {
+        var img = ctx.getImageData(0, 0, w, h), d = img.data;
+        for (var i = 0; i < d.length; i += 4) {
+            var g = 0.299 * d[i] + 0.587 * d[i+1] + 0.114 * d[i+2];
+            g = g < 110 ? 0 : (g > 165 ? 255 : g);
+            d[i] = d[i+1] = d[i+2] = g;
+        }
+        ctx.putImageData(img, 0, 0);
+    } catch (e) {}
+    return c;
+}
+
+async function scanCanvasIntoBox(canvas, statusEl) {
+    var say = function(t, ok) { if (statusEl) statusEl.textContent = t; else showBulkMsg(t, ok); };
+    say('Reading numbers (can take a few seconds)...', true);
+    try {
+        var result = await Tesseract.recognize(canvas, 'eng', { tessedit_char_whitelist: '0123456789 +' });
+        var text = (result.data && result.data.text) || '';
+        var nums = extractNumbers(text);
+        if (nums.length === 0) {
+            say('No 9-digit numbers found. Try a sharper, well-lit photo.', false);
+            return 0;
+        }
+        var box = document.getElementById('bulk-text');
+        var existing = box.value.trim();
+        box.value = (existing ? existing + '\n' : '') + nums.join('\n');
+        showBulkMsg('Read ' + nums.length + ' number(s) into the box. Check them, then tap Add all.', true);
+        return nums.length;
+    } catch (e) {
+        say('Could not read the image: ' + e.message, false);
+        return 0;
+    }
+}
+
+// Photo upload (pick an existing clear photo)
+document.getElementById('photo-input').addEventListener('change', function(e) {
+    var file = e.target.files && e.target.files[0];
+    if (!file) return;
+    var img = new Image();
+    img.onload = async function() {
+        var c = document.createElement('canvas');
+        c.width = img.naturalWidth; c.height = img.naturalHeight;
+        c.getContext('2d').drawImage(img, 0, 0);
+        await scanCanvasIntoBox(preprocess(c), null);
+        URL.revokeObjectURL(img.src);
+    };
+    img.src = URL.createObjectURL(file);
+    e.target.value = '';
+});
+
+// ---------------- LIVE CAMERA ----------------
+var camStream = null;
 document.getElementById('scan-btn').addEventListener('click', openCamera);
 
 async function openCamera() {
@@ -445,13 +587,14 @@ async function openCamera() {
     modal.style.display = 'flex';
     document.getElementById('cam-results').innerHTML = '';
     capBtn.textContent = 'Capture';
+    capBtn.disabled = false;
     capBtn.onclick = captureNumbers;
     document.getElementById('cam-status').textContent = 'Starting camera...';
     try {
         camStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } } });
         video.srcObject = camStream;
         video.style.display = 'block';
-        document.getElementById('cam-status').textContent = 'Point at the numbers and tap Capture.';
+        document.getElementById('cam-status').textContent = 'Fill the frame with the numbers and tap Capture.';
     } catch (e) {
         document.getElementById('cam-status').textContent = 'Cannot open camera: ' + e.message;
     }
@@ -477,61 +620,10 @@ async function captureNumbers() {
     canvas.height = video.videoHeight;
     canvas.getContext('2d').drawImage(video, 0, 0);
     stopCam();
+    document.getElementById('cam-capture').disabled = true;
 
-    status.textContent = 'Reading numbers (this can take a few seconds)...';
-    try {
-        var result = await Tesseract.recognize(canvas, 'eng', { tessedit_char_whitelist: '0123456789 +' });
-        var text = (result.data && result.data.text) || '';
-
-        // Find digit groups (may contain spaces/dashes), normalise each to a 9-digit number.
-        var groups = text.match(/[0-9][0-9 \\t\\-]{7,}[0-9]/g) || [];
-        var found = [];
-        groups.forEach(function(g) {
-            var d = g.replace(/\\D/g, '');
-            if (d.indexOf('260') === 0) d = d.slice(3);
-            while (d.length > 9 && d.charAt(0) === '0') d = d.slice(1);
-            if (d.length === 9 && found.indexOf(d) < 0) found.push(d);
-        });
-
-        if (found.length === 0) {
-            status.textContent = 'No 9-digit numbers found. Try again — good light, one number per line.';
-            document.getElementById('cam-capture').textContent = 'Try again';
-            document.getElementById('cam-capture').onclick = openCamera;
-            return;
-        }
-
-        status.textContent = 'Found ' + found.length + ' number(s). Adding...';
-        var results = document.getElementById('cam-results');
-        results.innerHTML = '';
-
-        for (var i = 0; i < found.length; i++) {
-            var phone = found[i];
-            var row = document.createElement('div');
-            row.style.padding = '3px 0';
-            row.textContent = '... ' + phone;
-            results.appendChild(row);
-            try {
-                var resp = await fetch('/add-account', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ phone: phone })
-                });
-                var d = await resp.json();
-                row.textContent = (d.success ? '✅ ' : '⚠️ ') + phone + (d.success ? '  added' : '  ' + (d.error || 'skipped'));
-            } catch (e) {
-                row.textContent = '⚠️ ' + phone + '  network error';
-            }
-        }
-
-        status.textContent = 'Done. Tap "Scan again" for more, or Close.';
-        if (window.refreshStats) window.refreshStats();
-        document.getElementById('cam-capture').textContent = 'Scan again';
-        document.getElementById('cam-capture').onclick = openCamera;
-    } catch (e) {
-        status.textContent = 'Could not read the image: ' + e.message;
-        document.getElementById('cam-capture').textContent = 'Try again';
-        document.getElementById('cam-capture').onclick = openCamera;
-    }
+    var n = await scanCanvasIntoBox(preprocess(canvas), status);
+    setTimeout(closeCamera, n > 0 ? 900 : 2500);
 }
 </script>
 </body>
