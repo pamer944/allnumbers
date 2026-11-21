@@ -4,7 +4,7 @@ const { pool, initDB, getAll, count, exists, add, remove, changeAll, REMOVE_PASS
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(express.json({ limit: '15mb' }));
+app.use(express.json());
 
 app.use((req, res, next) => {
     res.header("Access-Control-Allow-Origin", "*");
@@ -73,44 +73,6 @@ app.post('/add-bulk', async (req, res) => {
         res.json({ success: true, added: added, skipped: skipped, invalid: invalid });
     } catch (e) {
         res.status(500).json({ success: false, error: e.message });
-    }
-});
-
-// ---------------- HANDWRITING OCR via Google Cloud Vision ----------------
-app.post('/scan-image', async (req, res) => {
-    try {
-        var key = process.env.GOOGLE_VISION_API_KEY;
-        if (!key) {
-            return res.json({ success: false, error: 'Scanner not set up: add GOOGLE_VISION_API_KEY in Railway Variables.' });
-        }
-        var image = req.body && req.body.image;
-        if (!image) return res.json({ success: false, error: 'No image received.' });
-        // strip data URL prefix if present
-        var comma = image.indexOf('base64,');
-        if (comma !== -1) image = image.slice(comma + 7);
-
-        var visionResp = await fetch('https://vision.googleapis.com/v1/images:annotate?key=' + encodeURIComponent(key), {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                requests: [{
-                    image: { content: image },
-                    features: [{ type: 'DOCUMENT_TEXT_DETECTION' }]
-                }]
-            })
-        });
-        var data = await visionResp.json();
-        if (data.error) {
-            return res.json({ success: false, error: 'Vision: ' + data.error.message });
-        }
-        var r0 = data.responses && data.responses[0];
-        if (r0 && r0.error) {
-            return res.json({ success: false, error: 'Vision: ' + r0.error.message });
-        }
-        var text = (r0 && r0.fullTextAnnotation && r0.fullTextAnnotation.text) || '';
-        res.json({ success: true, text: text });
-    } catch (e) {
-        res.json({ success: false, error: e.message });
     }
 });
 
@@ -316,6 +278,7 @@ app.get('/', async (req, res) => {
 <head>
 <title>All Numbers - Total</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
@@ -508,7 +471,7 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
 
 <script>
 // ---------------- EXTRACTION ----------------
-// Strict: used when SAVING (Add all) - only real 9-digit numbers.
+// Only real 9-digit numbers. Anything else is dropped.
 function extractNumbers(text) {
     var out = [], seen = {};
     String(text).split(/[\\r\\n]+/).forEach(function(line) {
@@ -522,19 +485,18 @@ function extractNumbers(text) {
     return out;
 }
 
-// Loose: used to FILL the box from a scan - keep every candidate (6-12 digits)
-// so NOTHING is dropped; unclear ones get flagged for you to fix.
-function extractForBox(text) {
-    var out = [], seen = {};
+// Count of raw candidates (any length) so we can tell how many were unreadable.
+function countCandidates(text) {
+    var seen = {}, n = 0;
     String(text).split(/[\\r\\n]+/).forEach(function(line) {
         line.split(/\\s{2,}|[,;|\\t]+/).forEach(function(cell) {
             var d = cell.replace(/\\D/g, '');
             if (d.indexOf('260') === 0) d = d.slice(3);
             while (d.length > 12 && d.charAt(0) === '0') d = d.slice(1);
-            if (d.length >= 6 && d.length <= 12 && !seen[d]) { seen[d] = 1; out.push(d); }
+            if (d.length >= 6 && d.length <= 12 && !seen[d]) { seen[d] = 1; n++; }
         });
     });
-    return out;
+    return n;
 }
 
 function showBulkMsg(text, ok) {
@@ -542,13 +504,13 @@ function showBulkMsg(text, ok) {
     el.textContent = text;
     el.className = 'msg ' + (ok ? 'msg-ok' : 'msg-err');
     el.style.display = 'block';
-    setTimeout(function() { el.style.display = 'none'; }, 12000);
+    setTimeout(function() { el.style.display = 'none'; }, 10000);
 }
 
 // ---------------- BULK ADD ----------------
 document.getElementById('bulk-add-btn').addEventListener('click', async function() {
     var nums = extractNumbers(document.getElementById('bulk-text').value);
-    if (nums.length === 0) { showBulkMsg('No clean 9-digit numbers found. Fix the flagged ones first.', false); return; }
+    if (nums.length === 0) { showBulkMsg('No clean 9-digit numbers found.', false); return; }
     var btn = this, old = btn.textContent;
     btn.disabled = true; btn.textContent = 'Adding ' + nums.length + '...';
     try {
@@ -567,62 +529,56 @@ document.getElementById('bulk-add-btn').addEventListener('click', async function
     btn.disabled = false; btn.textContent = old;
 });
 
-// ---------------- IMAGE -> SERVER (Google Vision) -> BOX ----------------
-// Downscale big photos and return JPEG base64 (smaller upload, faster).
-function canvasToBase64(src) {
+// ---------------- IMAGE -> OCR (in-browser Tesseract) -> BOX ----------------
+function preprocess(src) {
     var maxSide = Math.max(src.width, src.height) || 1;
-    var scale = 2000 / maxSide;
-    if (scale > 1) scale = 1;
+    var scale = 2600 / maxSide;
+    if (scale > 3.5) scale = 3.5;
+    if (scale < 0.4) scale = 0.4;
     var w = Math.max(1, Math.round(src.width * scale));
     var h = Math.max(1, Math.round(src.height * scale));
     var c = document.createElement('canvas');
     c.width = w; c.height = h;
-    c.getContext('2d').drawImage(src, 0, 0, w, h);
-    return c.toDataURL('image/jpeg', 0.9);
+    var ctx = c.getContext('2d');
+    ctx.drawImage(src, 0, 0, w, h);
+    try {
+        var img = ctx.getImageData(0, 0, w, h), d = img.data;
+        for (var i = 0; i < d.length; i += 4) {
+            var g = 0.299 * d[i] + 0.587 * d[i+1] + 0.114 * d[i+2];
+            g = g < 120 ? 0 : (g > 160 ? 255 : g);
+            d[i] = d[i+1] = d[i+2] = g;
+        }
+        ctx.putImageData(img, 0, 0);
+    } catch (e) {}
+    return c;
 }
 
 async function scanCanvasIntoBox(canvas) {
-    showBulkMsg('Reading the photo... please wait a few seconds.', true);
-    var dataUrl;
-    try { dataUrl = canvasToBase64(canvas); }
-    catch (e) { showBulkMsg('Could not process that image.', false); return 0; }
+    showBulkMsg('Reading... this can take 15-30 seconds. Please wait.', true);
     try {
-        var resp = await fetch('/scan-image', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ image: dataUrl })
+        var result = await Tesseract.recognize(canvas, 'eng', {
+            tessedit_char_whitelist: '0123456789 +',
+            tessedit_pageseg_mode: '6'
         });
-        var d = await resp.json();
-        if (!d.success) { showBulkMsg(d.error || 'Scan failed.', false); return 0; }
-        var cands = extractForBox(d.text || '');
-        if (cands.length === 0) {
-            showBulkMsg('No numbers found in that photo. Try a clearer, closer shot.', false);
+        var text = (result.data && result.data.text) || '';
+        var nums = extractNumbers(text);          // only clean 9-digit
+        var totalSeen = countCandidates(text);    // everything it tried to read
+        var dropped = totalSeen - nums.length;
+        if (nums.length === 0) {
+            showBulkMsg('No clear 9-digit numbers found. Try one column at a time, zoomed in, good light.', false);
             return 0;
         }
         var box = document.getElementById('bulk-text');
-        var startPos = box.value.trim() ? box.value.trim().split(/\\n/).length : 0;
-        var lines = [], unclear = [];
-        cands.forEach(function(d2, i) {
-            var pos = startPos + i + 1;
-            if (d2.length === 9) {
-                lines.push(d2);
-            } else {
-                var end = d2.slice(-2);
-                lines.push(d2 + '   <-- #' + pos + ' NOT CLEAR, ' + d2.length + ' digits, need 9');
-                unclear.push('#' + pos + ' (ends ' + end + ', ' + d2.length + ' digits)');
-            }
-        });
         var existing = box.value.trim();
-        box.value = (existing ? existing + '\\n' : '') + lines.join('\\n');
-        var clean = cands.length - unclear.length;
-        if (unclear.length === 0) {
-            showBulkMsg('Read ' + cands.length + ' numbers, all clean (9 digits). Check them, then Add all.', true);
+        box.value = (existing ? existing + '\\n' : '') + nums.join('\\n');
+        if (dropped > 0) {
+            showBulkMsg('Added ' + nums.length + ' clean 9-digit numbers to the box. ' + dropped + ' were not clear and were skipped. Tap Add all.', true);
         } else {
-            showBulkMsg('Read ' + cands.length + ': ' + clean + ' clean. CHECK -> ' + unclear.join('  |  ') + '. Each is marked in the box - fix then Add all.', false);
+            showBulkMsg('Added ' + nums.length + ' clean 9-digit numbers to the box. Tap Add all.', true);
         }
-        return cands.length;
+        return nums.length;
     } catch (e) {
-        showBulkMsg('Network error talking to scanner.', false);
+        showBulkMsg('Could not read the image: ' + e.message, false);
         return 0;
     }
 }
@@ -637,7 +593,7 @@ document.getElementById('photo-input').addEventListener('change', function(e) {
         var c = document.createElement('canvas');
         c.width = img.naturalWidth; c.height = img.naturalHeight;
         c.getContext('2d').drawImage(img, 0, 0);
-        await scanCanvasIntoBox(c);
+        await scanCanvasIntoBox(preprocess(c));
         URL.revokeObjectURL(img.src);
     };
     img.onerror = function() { showBulkMsg('Could not open that photo. Try another.', false); };
@@ -663,7 +619,7 @@ async function openCamera() {
         camStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } } });
         video.srcObject = camStream;
         video.style.display = 'block';
-        document.getElementById('cam-status').textContent = 'Fill the frame with the list, hold steady, tap Capture.';
+        document.getElementById('cam-status').textContent = 'Zoom in on ONE column, fill the frame, hold steady, tap Capture.';
     } catch (e) {
         document.getElementById('cam-status').textContent = 'Cannot open camera: ' + e.message;
     }
@@ -690,7 +646,7 @@ async function captureNumbers() {
     stopCam();
     status.textContent = 'Reading... closing shortly, check the box below.';
     document.getElementById('cam-capture').disabled = true;
-    var n = await scanCanvasIntoBox(canvas);
+    var n = await scanCanvasIntoBox(preprocess(canvas));
     closeCamera();
 }
 
