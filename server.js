@@ -471,21 +471,29 @@ body{font-family:sans-serif;background:#04060a;min-height:100vh;display:flex;ali
 
 <script>
 // ---------------- EXTRACTION ----------------
-// Only real 9-digit numbers. Anything else is dropped.
+// Turn one text cell into a clean 9-digit number, or '' if it isn't one.
+function cleanTo9(raw) {
+    var d = String(raw).replace(/\\D/g, '');
+    if (d.indexOf('260') === 0) d = d.slice(3);           // drop Zambia country code
+    while (d.length > 9 && d.charAt(0) === '0') d = d.slice(1); // drop leading zeros
+    return d.length === 9 ? d : '';
+}
+
+// Pull every clean 9-digit number out of free text.
+// Per line: try the whole line as one number (handles "260 968 154474"),
+// AND try each space-separated token (handles two numbers on one line).
 function extractNumbers(text) {
     var out = [], seen = {};
+    function take(v) { if (v && !seen[v]) { seen[v] = 1; out.push(v); } }
     String(text).split(/[\\r\\n]+/).forEach(function(line) {
-        line.split(/\\s{2,}|[,;|\\t]+/).forEach(function(cell) {
-            var d = cell.replace(/\\D/g, '');
-            if (d.indexOf('260') === 0) d = d.slice(3);
-            while (d.length > 9 && d.charAt(0) === '0') d = d.slice(1);
-            if (d.length === 9 && !seen[d]) { seen[d] = 1; out.push(d); }
-        });
+        take(cleanTo9(line));
+        line.split(/\\s+|[,;|\\t]+/).forEach(function(tok) { take(cleanTo9(tok)); });
     });
     return out;
 }
 
-// Count of raw candidates (any length) so we can tell how many were unreadable.
+// Rough count of things that looked like a number (6-12 digits) so we can say
+// how many were skipped as unclear.
 function countCandidates(text) {
     var seen = {}, n = 0;
     String(text).split(/[\\r\\n]+/).forEach(function(line) {
@@ -561,20 +569,21 @@ async function scanCanvasIntoBox(canvas) {
             tessedit_pageseg_mode: '6'
         });
         var text = (result.data && result.data.text) || '';
-        var nums = extractNumbers(text);          // only clean 9-digit
-        var totalSeen = countCandidates(text);    // everything it tried to read
+        var nums = extractNumbers(text);
+        var totalSeen = countCandidates(text);
         var dropped = totalSeen - nums.length;
+        if (dropped < 0) dropped = 0;
         if (nums.length === 0) {
-            showBulkMsg('No clear 9-digit numbers found. Try one column at a time, zoomed in, good light.', false);
+            showBulkMsg('No clear 9-digit numbers found. Try zoomed in, in good light.', false);
             return 0;
         }
         var box = document.getElementById('bulk-text');
         var existing = box.value.trim();
         box.value = (existing ? existing + '\\n' : '') + nums.join('\\n');
         if (dropped > 0) {
-            showBulkMsg('Added ' + nums.length + ' clean 9-digit numbers to the box. ' + dropped + ' were not clear and were skipped. Tap Add all.', true);
+            showBulkMsg('Added ' + nums.length + ' clean 9-digit numbers. ' + dropped + ' were not clear and were skipped. Tap Add all.', true);
         } else {
-            showBulkMsg('Added ' + nums.length + ' clean 9-digit numbers to the box. Tap Add all.', true);
+            showBulkMsg('Added ' + nums.length + ' clean 9-digit numbers. Tap Add all.', true);
         }
         return nums.length;
     } catch (e) {
@@ -619,7 +628,7 @@ async function openCamera() {
         camStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } } });
         video.srcObject = camStream;
         video.style.display = 'block';
-        document.getElementById('cam-status').textContent = 'Zoom in on ONE column, fill the frame, hold steady, tap Capture.';
+        document.getElementById('cam-status').textContent = 'Fill the frame with the number(s), hold steady, tap Capture.';
     } catch (e) {
         document.getElementById('cam-status').textContent = 'Cannot open camera: ' + e.message;
     }
